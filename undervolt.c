@@ -41,7 +41,7 @@
 
 #define UNDERVOLT_NAME "undervolt"
 #define UNDERVOLT_DESCRIPTION "Undervolt driver for HTC/Qualcomm devices"
-#define UNDERVOLT_VERSION "1.0"
+#define UNDERVOLT_VERSION "1.0a"
 
 MODULE_VERSION(UNDERVOLT_VERSION);
 MODULE_LICENSE("Dual MIT/GPL");
@@ -59,10 +59,22 @@ struct clkctl_acpu_speed {
 	unsigned axiclk_khz;
 };
 
+#define CPUFREQ_ENTRY_INVALID ~0
+#define CPUFREQ_TABLE_END     ~1
+struct cpufreq_frequency_table {
+	unsigned index;
+	unsigned frequency;
+};
+
 struct uv_map {
 	unsigned acpu_khz;
 	int      vdd;
 	int      uv_vdd;
+};
+
+struct oc_map {
+	unsigned frequency;
+	unsigned oc_frequency;
 };
 
 struct m_search_pat {
@@ -70,19 +82,22 @@ struct m_search_pat {
 	unsigned mask;
 };
 
-#define PROC_NAME UNDERVOLT_NAME
-
-#define UV_ENTRY_MAX 31
-
 extern int regulator_set_voltage(void *, int, int);
+extern void cpufreq_frequency_table_get_attr(void *, int);
 
+#define PROC_NAME UNDERVOLT_NAME
 static struct proc_dir_entry *proc_entry = NULL;
 
-static struct clkctl_acpu_speed *acpu_freq_tbl = NULL;
+static char read_buf[16];
 
+#define UV_ENTRY_MAX 31
 static struct uv_map undervolt_tbl[UV_ENTRY_MAX + 1];
-
 static DEFINE_MUTEX(uv_mutex);
+
+static int vdd_undervolt = 0;
+
+static struct clkctl_acpu_speed *acpu_freq_tbl = NULL;
+static struct cpufreq_frequency_table *freq_table = NULL;
 
 #if 0
 /*
@@ -105,8 +120,14 @@ static unsigned long fixup_addr = 0;
 static unsigned long fixup_size = DEFAULT_FIXUP_SIZE;
 #endif
 
+static unsigned long acpuclk_set_rate_addr = 0;
+
 #define DEFAULT_ASR_DEPTH (16 * sizeof(unsigned))
 static unsigned long acpuclk_set_rate_depth = DEFAULT_ASR_DEPTH;
+
+#define DEFAULT_CFTGA_DEPTH (2 * sizeof(unsigned))
+static unsigned long cpufreq_frequency_table_get_attr_depth =
+	DEFAULT_CFTGA_DEPTH;
 
 #define DEFAULT_RSV_DEPTH (48 * sizeof(unsigned))
 static unsigned long regulator_set_voltage_depth = DEFAULT_RSV_DEPTH;
@@ -119,6 +140,13 @@ static unsigned long regulator_set_voltage_depth = DEFAULT_RSV_DEPTH;
 static struct m_search_pat acpuclk_set_rate_pat[] = {
 	{ 0xe59f0000, 0xffff0000 },
 	{ 0xe5900000, 0xfff00fff },
+	{ 0 },
+};
+
+
+static struct m_search_pat cpufreq_frequency_table_get_attr_pat[] = {
+	{ 0xe59f0000, 0xffff0000 },
+	{ 0xe5800000, 0xfff0ffff },
 	{ 0 },
 };
 
@@ -139,12 +167,6 @@ static struct m_search_pat regulator_set_voltage_pat[] = {
 	{ 0 },
 };
 
-static unsigned long acpuclk_set_rate_addr = 0;
-
-static int vdd_undervolt = 0;
-
-static char read_buf[16];
-
 static int __init undervolt_init(void);
 static void __exit undervolt_exit(void);
 static int undervolt_read(char *page, char **start, off_t off, int count,
@@ -154,6 +176,9 @@ static int undervolt_write(struct file *filp, const char __user *buf,
 static unsigned *m_search(struct m_search_pat *n, unsigned *hp, unsigned *l);
 static struct clkctl_acpu_speed *get_freq_tbl(struct m_search_pat *pat,
                                               void *addr, unsigned long depth);
+static struct cpufreq_frequency_table *get_freq_table(struct m_search_pat *pat,
+                                                      void *addr,
+                                                      unsigned long depth);
 static int patch_reg_set_voltage(struct m_search_pat *pat, void *addr,
                                  unsigned long depth);
 static int init_uv_tbl(struct uv_map *uv_tbl,
@@ -168,6 +193,9 @@ MODULE_PARM_DESC(acpuclk_set_rate_addr, "acpuclk_set_rate function address");
 module_param(acpuclk_set_rate_depth, long, S_IRUGO);
 MODULE_PARM_DESC(acpuclk_set_rate_depth,
                  "acpuclk_set_rate function search depth");
+module_param(cpufreq_frequency_table_get_attr_depth, long, S_IRUGO);
+MODULE_PARM_DESC(cpufreq_frequency_table_get_attr_depth,
+                 "cpufreq_frequency_table_get_attr function search depth");
 module_param(regulator_set_voltage_depth, long, S_IRUGO);
 MODULE_PARM_DESC(regulator_set_voltage_depth,
                  "regulator_set_voltage function search depth");
@@ -180,42 +208,50 @@ module_exit(undervolt_exit);
 int undervolt_init(void)
 {
 	printk(KERN_INFO "%s: %s %s\n", UNDERVOLT_NAME, UNDERVOLT_DESCRIPTION,
-               UNDERVOLT_VERSION);
+	       UNDERVOLT_VERSION);
 	printk(KERN_INFO "%s: (c) 2010 Albert Lee <trisk@forkgnu.org>\n",
-               UNDERVOLT_NAME);
+	       UNDERVOLT_NAME);
 
 	if (acpuclk_set_rate_addr == 0) {
 		printk(KERN_ERR "%s: Missing required parameter " \
-                       "'acpuclk_set_rate_addr'\n",
-                       __func__);
+		       "`acpuclk_set_rate_addr'\n",
+		       __func__);
 		return -EINVAL;
 	}
 
 	proc_entry = create_proc_entry(PROC_NAME, S_IFREG | S_IWUSR | S_IRUGO,
-                                       NULL);
+	                               NULL);
 	if (proc_entry == NULL) {
 		printk(KERN_ERR "%s: Unable to create /proc/%s\n",
-                       __func__, PROC_NAME);
+		       __func__, PROC_NAME);
 		return -ENOMEM;
 	}
 	proc_entry->read_proc = undervolt_read;
 	proc_entry->write_proc = undervolt_write;
 
 	acpu_freq_tbl = get_freq_tbl(acpuclk_set_rate_pat,
-                                     (void *)acpuclk_set_rate_addr,
-                                     acpuclk_set_rate_depth);
+	                             (void *)acpuclk_set_rate_addr,
+	                             acpuclk_set_rate_depth);
 	if (acpu_freq_tbl == NULL) {
 		printk(KERN_ERR "%s: acpu_freq_tbl not found\n", __func__);
 		undervolt_exit();
 		return -ENXIO;
 	}
 
+	freq_table = get_freq_table(cpufreq_frequency_table_get_attr_pat,
+	                            (void *)cpufreq_frequency_table_get_attr,
+	                            cpufreq_frequency_table_get_attr_depth);
+	if (freq_table == NULL) {
+		printk(KERN_INFO "%s: freq_table for cpufreq not found, " \
+		       "overclocking will not be possible\n", UNDERVOLT_NAME);
+	}
+
 	if (patch_reg_set_voltage(regulator_set_voltage_pat,
-                                   (void *)regulator_set_voltage,
-                                   regulator_set_voltage_depth) != 0) {
+	                          (void *)regulator_set_voltage,
+	                          regulator_set_voltage_depth) != 0) {
 		printk(KERN_INFO "%s: Unable to patch regulator_set_voltage, " \
-                       "voltage will be subject to board constraints\n",
-                       UNDERVOLT_NAME);
+		       "voltage will be subject to board constraints\n",
+		       UNDERVOLT_NAME);
 	}
 
 	init_uv_tbl(undervolt_tbl, acpu_freq_tbl);
@@ -225,7 +261,7 @@ int undervolt_init(void)
 		update_freq_tbl(acpu_freq_tbl, undervolt_tbl, 1);
 	}
 
-        return 0;
+	return 0;
 }
 
 void undervolt_exit(void)
@@ -239,7 +275,7 @@ void undervolt_exit(void)
 		proc_entry = NULL;
 	}
 
-        return;
+	return;
 }
 
 int undervolt_read(char *page, char **start, off_t off, int count, int *eof,
@@ -291,12 +327,15 @@ int undervolt_write(struct file *filp, const char __user *buf,
 		switch (read_buf[0]) {
 		case '0':
 		case '1':
+			i = read_buf[0] - '0';
 			mutex_lock(&uv_mutex);
-			update_freq_tbl(acpu_freq_tbl, undervolt_tbl,
-                                        read_buf[0] - '0');
+			update_freq_tbl(acpu_freq_tbl, undervolt_tbl, i);
+			if (i == 0) {
+				init_uv_tbl(undervolt_tbl, acpu_freq_tbl);
+			}
 			mutex_unlock(&uv_mutex);
 			printk(KERN_INFO "%s: acpu_freq_tbl updated\n",
-                               UNDERVOLT_NAME);
+			       UNDERVOLT_NAME);
 		default:
 			return len;
 		}
@@ -350,7 +389,8 @@ unsigned *m_search(struct m_search_pat *n, unsigned *hp, unsigned *l)
 #endif
 		if ((*hp & np->mask) == np->word) {
 #ifdef DEBUG
-			printk(KERN_DEBUG "%s:  matches: %08x\n", __func__, *hp & np->mask);
+			printk(KERN_DEBUG "%s:  matches: %08x\n", __func__,
+			       *hp & np->mask);
 #endif
 			np++;
 
@@ -396,10 +436,34 @@ struct clkctl_acpu_speed *get_freq_tbl(struct m_search_pat *pat, void *addr,
 	/* e59f?XXX ldr */
 	tblp = (void **)((unsigned)insn + (*insn & 0xfff) + 0x8);
 	tbl = (struct clkctl_acpu_speed *)(*tblp);
-	if ((tbl->acpu_khz == 19200) && (tbl->axiclk_khz == 14000))
-		return tbl;
+	if ((tbl->acpu_khz != 19200) || (tbl->axiclk_khz != 14000)) {
+		return NULL;
+	}
 
-	return NULL;
+	return tbl;
+}
+
+struct cpufreq_frequency_table *get_freq_table(struct m_search_pat *pat,
+                                               void *addr,
+                                               unsigned long depth)
+{
+	unsigned *insn;
+	void **tblp;
+	struct cpufreq_frequency_table *tbl;
+
+	insn = m_search(pat, addr, addr + depth);
+	if (insn == NULL) {
+		return NULL;
+	}
+	
+	/* e59f?XXX ldr */
+	tblp = (void **)((unsigned)insn + (*insn & 0xfff) + 0x8);
+	tbl = (struct cpufreq_frequency_table *)(*tblp);
+	if ((tbl->index != 0) || (tbl->frequency != CPUFREQ_ENTRY_INVALID)) {
+		return NULL;
+	}
+
+	return tbl;
 }
 
 int patch_reg_set_voltage(struct m_search_pat *pat, void *addr,
